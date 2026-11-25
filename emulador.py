@@ -29,6 +29,17 @@ CUENTA, REGION, STAGE = "123456789012", "us-east-1", "dev"
 SERVICIOS = ["ms-auth", "ms-cursos", "ms-evaluaciones", "ms-analitica", "ms-notificaciones", "ms-practica"]
 
 
+def _clave_y_default(ref):
+    """De `opt:stage, 'dev'` saca ("stage", "dev"); sin coma tras la clave, el default es None."""
+    if "," not in ref:
+        return ref.split(":", 1)[1].strip(), None
+    clave, resto = ref.split(",", 1)
+    defecto = resto.strip()
+    if len(defecto) >= 2 and defecto[0] == defecto[-1] and defecto[0] in "'\"":
+        defecto = defecto[1:-1]
+    return clave.split(":", 1)[1].strip(), defecto
+
+
 def _resolver(v, yml):
     if isinstance(v, dict):
         return {k: _resolver(x, yml) for k, x in v.items()}
@@ -43,7 +54,22 @@ def _resolver(v, yml):
         if ref == "aws:accountId": return CUENTA
         if ref == "sls:stage": return STAGE
         if ref == "cf:sp-infra-dev.DbEndpoint": return "sp-rds-dev.abc123.us-east-1.rds.amazonaws.com"
-        if ref == "env:DB_PASSWORD": return os.environ.get("DB_PASSWORD", "ClaveDePrueba2026")
+        if ref.startswith("AWS::"):                       # pseudo-parámetros de CloudFormation (Fn::Sub)
+            pseudo = {"AWS::Region": REGION, "AWS::AccountId": CUENTA, "AWS::Partition": "aws",
+                      "AWS::URLSuffix": "amazonaws.com"}
+            if ref in pseudo: return pseudo[ref]
+        if ref == "ApiGatewayRestApi": return "api"       # id lógico de la REST API, resuelto por CloudFormation
+        if ref.startswith("opt:"):
+            clave, defecto = _clave_y_default(ref)
+            if clave == "stage": return STAGE
+            if clave == "region": return REGION
+            if defecto is not None: return defecto
+        if ref.startswith("env:"):
+            clave, defecto = _clave_y_default(ref)
+            valor = os.environ.get(clave)
+            if valor: return valor
+            if defecto is not None: return defecto
+            return {"DB_PASSWORD": "ClaveDePrueba2026"}.get(clave, "")
         if ref.startswith("self:"):
             cur = yml
             for p in ref[5:].split("."):
@@ -143,7 +169,23 @@ class Emulador:
         boto3.ESTADO["tablas"][p["TableName"]] = t
 
     def _verificar_common(self):
-        hashes = {s: hashlib.sha256((RAIZ / s / "common.py").read_bytes()).hexdigest() for s in SERVICIOS}
+        """Los servicios de negocio comparten common.py; ms-auth usa una versión propia.
+
+        Se compara el AST sin el docstring del módulo, que es la única diferencia
+        entre ms-cursos/ms-notificaciones y el resto.
+        """
+        import ast
+
+        def huella(ruta):
+            arbol = ast.parse(ruta.read_text(encoding="utf-8"))
+            cuerpo = arbol.body
+            primero = cuerpo[0] if cuerpo else None
+            if (isinstance(primero, ast.Expr) and isinstance(getattr(primero, "value", None), ast.Constant)
+                    and isinstance(primero.value.value, str)):
+                cuerpo = cuerpo[1:]
+            return hashlib.sha256(ast.dump(ast.Module(body=cuerpo, type_ignores=[])).encode()).hexdigest()
+
+        hashes = {s: huella(RAIZ / s / "common.py") for s in SERVICIOS if s != "ms-auth"}
         assert len(set(hashes.values())) == 1, f"common.py difiere entre servicios: {hashes}"
 
     # ----------------------------------------------------------------- handlers
